@@ -41,6 +41,7 @@ pub const AlgId = enum(u8) {
 /// `readPositionalAll`, `writePositionalAll`, `length`, `setLength`, and
 /// `sync` methods matching the ones below.
 /// Naming and short-read behavior mirror `std.Io.File`.
+/// `FileStorage` below is the same interface, backed by a real file instead of memory.
 pub const MemoryStorage = struct {
     pub const Error = std.mem.Allocator.Error || error{OutOfBounds};
 
@@ -86,6 +87,50 @@ pub const MemoryStorage = struct {
 
     pub fn sync(self: *MemoryStorage) Error!void {
         _ = self;
+    }
+};
+
+/// A backing store over an already-open `std.Io.File`, for saving a RAF
+/// file to disk instead of keeping it in memory.
+///
+/// Every method here just calls the matching `std.Io.File` method with the
+/// same offset, so it satisfies the interface documented on `MemoryStorage`
+/// without redefining it.
+///
+/// The caller opens and closes the file. `FileStorage` only borrows it, the
+/// same way `Raf()` only borrows a `*Storage`.
+pub const FileStorage = struct {
+    pub const Error = std.Io.File.ReadPositionalError ||
+        std.Io.File.WritePositionalError ||
+        std.Io.File.LengthError ||
+        std.Io.File.SetLengthError ||
+        std.Io.File.SyncError;
+
+    file: std.Io.File,
+    io: std.Io,
+
+    pub fn init(file: std.Io.File, io: std.Io) FileStorage {
+        return .{ .file = file, .io = io };
+    }
+
+    pub fn readPositionalAll(self: *FileStorage, buffer: []u8, offset: u64) Error!usize {
+        return self.file.readPositionalAll(self.io, buffer, offset);
+    }
+
+    pub fn writePositionalAll(self: *FileStorage, bytes: []const u8, offset: u64) Error!void {
+        return self.file.writePositionalAll(self.io, bytes, offset);
+    }
+
+    pub fn length(self: *FileStorage) Error!u64 {
+        return self.file.length(self.io);
+    }
+
+    pub fn setLength(self: *FileStorage, new_length: u64) Error!void {
+        return self.file.setLength(self.io, new_length);
+    }
+
+    pub fn sync(self: *FileStorage) Error!void {
+        return self.file.sync(self.io);
     }
 };
 

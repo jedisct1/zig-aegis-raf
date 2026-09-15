@@ -7,6 +7,7 @@
 const raf = @import("raf.zig");
 
 pub const MemoryStorage = raf.MemoryStorage;
+pub const FileStorage = raf.FileStorage;
 pub const Info = raf.Info;
 pub const AlgId = raf.AlgId;
 pub const CreateOptions = raf.CreateOptions;

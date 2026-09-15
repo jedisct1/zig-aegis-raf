@@ -709,6 +709,35 @@ fn roundTrip(comptime Variant: fn (type) type, chunk_size: u32) !void {
     try testing.expectEqualSlices(u8, &data, buf[0..n]);
 }
 
+test "aegis128l_raf: FileStorage round-trips through a real file" {
+    const io = testing.io;
+    const RafT = raf.Aegis128LRaf(raf.FileStorage);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(io, "raf.bin", .{ .read = true });
+    defer file.close(io);
+    var storage = raf.FileStorage.init(file, io);
+
+    const key = newKey(RafT);
+
+    {
+        var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 4096 }, &key);
+        defer ctx.close();
+        _ = try ctx.write("Hello from a real file", 0);
+    }
+
+    // Reopen to confirm the header and chunks actually made it to disk,
+    // rather than just checking the still-open context's own state.
+    var ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    defer ctx.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try ctx.read(&buf, 0);
+    try testing.expectEqualSlices(u8, "Hello from a real file", buf[0..n]);
+}
+
 test "all variants round-trip" {
     try roundTrip(raf.Aegis128LRaf, 1024);
     try roundTrip(raf.Aegis128X2Raf, 1024);

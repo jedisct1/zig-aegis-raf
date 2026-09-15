@@ -443,6 +443,237 @@ test "deriveMasterKey: context longer than the KDF block rejects instead of over
     _ = try raf.deriveMasterKey(32, &master_key32, context_73[0..72]);
 }
 
+// A backing store that can be told to fail the next header write (always at
+// offset 0) or the next length change, to test that a failed mutation marks
+// the context failed instead of leaving it looking usable.
+const FailingStorage = struct {
+    pub const Error = raf.MemoryStorage.Error || error{InjectedFailure};
+
+    inner: raf.MemoryStorage,
+    fail_next_header_write: bool = false,
+    partially_fail_next_header_write: bool = false,
+    fail_next_shrink: bool = false,
+
+    fn deinit(self: *FailingStorage) void {
+        self.inner.deinit();
+    }
+
+    pub fn readPositionalAll(self: *FailingStorage, buffer: []u8, offset: u64) Error!usize {
+        return self.inner.readPositionalAll(buffer, offset);
+    }
+
+    pub fn writePositionalAll(self: *FailingStorage, bytes: []const u8, offset: u64) Error!void {
+        if (offset == 0 and self.partially_fail_next_header_write) {
+            self.partially_fail_next_header_write = false;
+            try self.inner.writePositionalAll(bytes[0..24], offset);
+            return error.InjectedFailure;
+        }
+        if (offset == 0 and self.fail_next_header_write) {
+            self.fail_next_header_write = false;
+            return error.InjectedFailure;
+        }
+        return self.inner.writePositionalAll(bytes, offset);
+    }
+
+    pub fn length(self: *FailingStorage) Error!u64 {
+        return self.inner.length();
+    }
+
+    pub fn setLength(self: *FailingStorage, new_length: u64) Error!void {
+        if (self.fail_next_shrink and new_length < self.inner.bytes.items.len) {
+            self.fail_next_shrink = false;
+            return error.InjectedFailure;
+        }
+        return self.inner.setLength(new_length);
+    }
+
+    pub fn sync(self: *FailingStorage) Error!void {
+        return self.inner.sync();
+    }
+};
+
+test "aegis128l_raf: a failed write requires reopen and does not lose data" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 4096 }, &key);
+    defer ctx.close();
+
+    storage.fail_next_header_write = true;
+    try testing.expectError(error.InjectedFailure, ctx.write("hello", 0));
+
+    // The write may have left a chunk record on disk without a header that
+    // acknowledges it. Every further call must fail until the file is reopened.
+    var buf: [5]u8 = undefined;
+    try testing.expectError(error.ContextFailed, ctx.read(&buf, 0));
+    try testing.expectError(error.ContextFailed, ctx.write("hello", 0));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    // The header write never landed, so the file is still empty.
+    try testing.expectEqual(0, ctx.length());
+    try testing.expectEqual(5, try ctx.write("hello", 0));
+    try testing.expectEqual(5, ctx.length());
+    try testing.expectEqual(5, try ctx.read(&buf, 0));
+    try testing.expectEqualSlices(u8, "hello", &buf);
+}
+
+test "aegis128l_raf: a torn header write recovers the preceding header" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    try testing.expectEqual(3, try ctx.write("old", 0));
+    storage.partially_fail_next_header_write = true;
+    try testing.expectError(error.InjectedFailure, ctx.write("new", 3));
+    try testing.expectError(error.ContextFailed, ctx.read(&.{}, 0));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    try testing.expectEqual(3, ctx.length());
+    var buf: [3]u8 = undefined;
+    try testing.expectEqual(3, try ctx.read(&buf, 0));
+    try testing.expectEqualSlices(u8, "old", &buf);
+
+    // A later mutation repairs the primary header and removes the recovery
+    // trailer before changing the recovered file.
+    try testing.expectEqual(1, try ctx.write("!", 3));
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    try testing.expectEqual(4, ctx.length());
+    var repaired: [4]u8 = undefined;
+    try testing.expectEqual(4, try ctx.read(&repaired, 0));
+    try testing.expectEqualSlices(u8, "old!", &repaired);
+    try testing.expectEqual(raf.header_size + RafT.nonce_length + 1024 + raf.tag_bytes, try storage.length());
+}
+
+test "aegis128l_raf: a torn shrink header recovers the preceding file" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    var data: [2000]u8 = undefined;
+    random.bytes(&data);
+    try testing.expectEqual(data.len, try ctx.write(&data, 0));
+
+    storage.partially_fail_next_header_write = true;
+    try testing.expectError(error.InjectedFailure, ctx.setLength(500));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    try testing.expectEqual(data.len, ctx.length());
+    var recovered: [2000]u8 = undefined;
+    try testing.expectEqual(data.len, try ctx.read(&recovered, 0));
+    try testing.expectEqualSlices(u8, &data, &recovered);
+}
+
+test "aegis128l_raf: a failed shrink requires reopen and does not lose data" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    var data: [2000]u8 = undefined;
+    random.bytes(&data);
+    _ = try ctx.write(&data, 0);
+
+    storage.fail_next_header_write = true;
+    try testing.expectError(error.InjectedFailure, ctx.setLength(500));
+    try testing.expectError(error.ContextFailed, ctx.setLength(500));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    // The smaller header never landed, so the original 2000 bytes survive.
+    try testing.expectEqual(2000, ctx.length());
+    var buf: [2000]u8 = undefined;
+    try testing.expectEqual(2000, try ctx.read(&buf, 0));
+    try testing.expectEqualSlices(u8, &data, &buf);
+
+    try ctx.setLength(500);
+    try testing.expectEqual(500, ctx.length());
+}
+
+test "aegis128l_raf: reopening after a failed physical shrink lets a same-size retry finish it" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    var data: [2048]u8 = undefined;
+    random.bytes(&data);
+    _ = try ctx.write(&data, 0);
+
+    storage.fail_next_shrink = true;
+    try testing.expectError(error.InjectedFailure, ctx.setLength(0));
+    try testing.expectError(error.ContextFailed, ctx.setLength(0));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    // The header already committed size 0. Only the backing store is still oversized.
+    try testing.expectEqual(0, ctx.length());
+    try ctx.setLength(0);
+    try testing.expectEqual(raf.header_size, try storage.length());
+}
+
+test "aegis128l_raf: an overflowing write is rejected without poisoning the context" {
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    const key = newKey(Aegis128LRaf);
+    var ctx = try Aegis128LRaf.create(testing.allocator, &mem, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    try testing.expectError(error.Overflow, ctx.write("x", std.math.maxInt(u64)));
+
+    // Rejected before touching storage: the context is still usable.
+    try testing.expectEqual(4, try ctx.write("test", 0));
+}
+
+test "aegis128l_raf: create refuses to replace a short existing file without truncate" {
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+    try mem.setLength(13);
+    random.bytes(mem.bytes.items);
+    var original: [13]u8 = undefined;
+    @memcpy(&original, mem.bytes.items);
+
+    const key = newKey(Aegis128LRaf);
+    try testing.expectError(error.FileExists, Aegis128LRaf.create(testing.allocator, &mem, random, .{ .chunk_size = 4096 }, &key));
+
+    // A rejected create() must not have touched the existing file at all.
+    try testing.expectEqualSlices(u8, &original, mem.bytes.items);
+
+    var ctx = try Aegis128LRaf.create(testing.allocator, &mem, random, .{ .chunk_size = 4096, .truncate = true }, &key);
+    defer ctx.close();
+    try testing.expectEqual(0, ctx.length());
+}
+
 test "MemoryStorage: an offset near u64's max does not overflow the bounds check" {
     var mem = raf.MemoryStorage.init(testing.allocator);
     defer mem.deinit();

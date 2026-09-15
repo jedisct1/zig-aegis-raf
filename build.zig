@@ -141,6 +141,120 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Optional cross-check against the libaegis C reference implementation.
+    // It builds libaegis's RAF sources directly, exposes them to Zig through
+    // translate-c, and runs src/interop_test.zig against both implementations.
+    // This only activates when libaegis is checked out as a sibling directory.
+    //
+    // It is not part of the default `test` step, since it depends on that
+    // external checkout. Run it with `zig build test-interop`.
+    interop: {
+        const libaegis_root = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, "../libaegis", b.allocator) catch break :interop;
+        const aegis_h_path = b.pathJoin(&.{ libaegis_root, "src/include/aegis.h" });
+
+        const libaegis_lib = b.addLibrary(.{
+            .name = "aegis",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }),
+        });
+        libaegis_lib.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ libaegis_root, "src/include" }) });
+
+        const relative_sources = [_][]const u8{
+            "src/aegis128l/aegis128l_aesni.c",
+            "src/aegis128l/aegis128l_altivec.c",
+            "src/aegis128l/aegis128l_neon_aes.c",
+            "src/aegis128l/aegis128l_neon_sha3.c",
+            "src/aegis128l/aegis128l_soft.c",
+            "src/aegis128l/aegis128l.c",
+
+            "src/aegis128x2/aegis128x2_aesni.c",
+            "src/aegis128x2/aegis128x2_altivec.c",
+            "src/aegis128x2/aegis128x2_avx2.c",
+            "src/aegis128x2/aegis128x2_neon_aes.c",
+            "src/aegis128x2/aegis128x2_soft.c",
+            "src/aegis128x2/aegis128x2.c",
+
+            "src/aegis128x4/aegis128x4_aesni.c",
+            "src/aegis128x4/aegis128x4_altivec.c",
+            "src/aegis128x4/aegis128x4_avx2.c",
+            "src/aegis128x4/aegis128x4_avx512.c",
+            "src/aegis128x4/aegis128x4_neon_aes.c",
+            "src/aegis128x4/aegis128x4_soft.c",
+            "src/aegis128x4/aegis128x4.c",
+
+            "src/aegis256/aegis256_aesni.c",
+            "src/aegis256/aegis256_altivec.c",
+            "src/aegis256/aegis256_neon_aes.c",
+            "src/aegis256/aegis256_soft.c",
+            "src/aegis256/aegis256.c",
+
+            "src/aegis256x2/aegis256x2_aesni.c",
+            "src/aegis256x2/aegis256x2_altivec.c",
+            "src/aegis256x2/aegis256x2_avx2.c",
+            "src/aegis256x2/aegis256x2_neon_aes.c",
+            "src/aegis256x2/aegis256x2_soft.c",
+            "src/aegis256x2/aegis256x2.c",
+
+            "src/aegis256x4/aegis256x4_aesni.c",
+            "src/aegis256x4/aegis256x4_altivec.c",
+            "src/aegis256x4/aegis256x4_avx2.c",
+            "src/aegis256x4/aegis256x4_avx512.c",
+            "src/aegis256x4/aegis256x4_neon_aes.c",
+            "src/aegis256x4/aegis256x4_soft.c",
+            "src/aegis256x4/aegis256x4.c",
+
+            "src/common/common.c",
+            "src/common/cpu.c",
+            "src/common/keccak.c",
+            "src/common/softaes.c",
+
+            "src/raf/raf.c",
+            "src/raf/raf_aegis128l.c",
+            "src/raf/raf_aegis128x2.c",
+            "src/raf/raf_aegis128x4.c",
+            "src/raf/raf_aegis256.c",
+            "src/raf/raf_aegis256x2.c",
+            "src/raf/raf_aegis256x4.c",
+            "src/raf/raf_kdf.c",
+            "src/raf/raf_merkle.c",
+        };
+        for (relative_sources) |rel| {
+            libaegis_lib.root_module.addCSourceFile(.{
+                .file = .{ .cwd_relative = b.pathJoin(&.{ libaegis_root, rel }) },
+                .flags = &.{"-std=c99"},
+            });
+        }
+
+        const aegis_h = b.addTranslateC(.{
+            .root_source_file = .{ .cwd_relative = aegis_h_path },
+            .target = target,
+            .optimize = .Debug,
+        });
+        aegis_h.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ libaegis_root, "src/include" }) });
+        const aegis_c_mod = aegis_h.createModule();
+
+        const interop_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/interop_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "aegis_c", .module = aegis_c_mod },
+                    .{ .name = "aegis_stream", .module = mod },
+                },
+            }),
+        });
+        interop_tests.root_module.linkLibrary(libaegis_lib);
+        const run_interop_tests = b.addRunArtifact(interop_tests);
+
+        const interop_step = b.step("test-interop", "Cross-check wire format against the libaegis C implementation (needs a sibling libaegis checkout)");
+        interop_step.dependOn(&run_interop_tests.step);
+    }
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

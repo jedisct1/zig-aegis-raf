@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("aegis_stream", .{
+    const mod = b.addModule("aegis_raf", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
         // in this file, which means that if you have declarations that you
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "aegis_stream",
+        .name = "aegis_raf",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -74,12 +74,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "aegis_stream" is the name you will use in your source code to
-                // import this module (e.g. `@import("aegis_stream")`). The name is
+                // Here "aegis_raf" is the name you will use in your source code to
+                // import this module (e.g. `@import("aegis_raf")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "aegis_stream", .module = mod },
+                .{ .name = "aegis_raf", .module = mod },
             },
         }),
     });
@@ -244,7 +244,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "aegis_c", .module = aegis_c_mod },
-                    .{ .name = "aegis_stream", .module = mod },
+                    .{ .name = "aegis_raf", .module = mod },
                 },
             }),
         });

@@ -5,10 +5,10 @@
 const std = @import("std");
 const testing = std.testing;
 const aegis_c = @import("aegis_c");
-const aegis_stream = @import("aegis_stream");
+const aegis_raf = @import("aegis_raf");
 
-const Aegis128LRaf = aegis_stream.Aegis128LRaf(aegis_stream.MemoryStorage);
-const Aegis256Raf = aegis_stream.Aegis256Raf(aegis_stream.MemoryStorage);
+const Aegis128LRaf = aegis_raf.Aegis128LRaf(aegis_raf.MemoryStorage);
+const Aegis256Raf = aegis_raf.Aegis256Raf(aegis_raf.MemoryStorage);
 
 var prng = std.Random.DefaultPrng.init(0xC0FFEE);
 const random = prng.random();
@@ -106,7 +106,7 @@ test "interop: libaegis creates AEGIS-128L RAF, this port reads it" {
     try testing.expectEqual(0, aegis_c.aegis128l_raf_write(&c_ctx, &bytes_written, plaintext.ptr, plaintext.len, 0));
     aegis_c.aegis128l_raf_close(&c_ctx);
 
-    var mem = aegis_stream.MemoryStorage.init(testing.allocator);
+    var mem = aegis_raf.MemoryStorage.init(testing.allocator);
     defer mem.deinit();
     try mem.bytes.appendSlice(testing.allocator, c_file.data.items);
 
@@ -128,7 +128,7 @@ test "interop: this port creates AEGIS-128L RAF, libaegis reads it" {
     const plaintext = try randomPayload(testing.allocator, 3000);
     defer testing.allocator.free(plaintext);
 
-    var mem = aegis_stream.MemoryStorage.init(testing.allocator);
+    var mem = aegis_raf.MemoryStorage.init(testing.allocator);
     defer mem.deinit();
 
     {
@@ -182,7 +182,7 @@ test "interop: libaegis creates AEGIS-256 RAF, this port reads it" {
     try testing.expectEqual(0, aegis_c.aegis256_raf_write(&c_ctx, &bytes_written, plaintext.ptr, plaintext.len, 0));
     aegis_c.aegis256_raf_close(&c_ctx);
 
-    var mem = aegis_stream.MemoryStorage.init(testing.allocator);
+    var mem = aegis_raf.MemoryStorage.init(testing.allocator);
     defer mem.deinit();
     try mem.bytes.appendSlice(testing.allocator, c_file.data.items);
 
@@ -204,7 +204,7 @@ test "interop: this port creates AEGIS-256 RAF, libaegis reads it" {
     const plaintext = try randomPayload(testing.allocator, 3000);
     defer testing.allocator.free(plaintext);
 
-    var mem = aegis_stream.MemoryStorage.init(testing.allocator);
+    var mem = aegis_raf.MemoryStorage.init(testing.allocator);
     defer mem.deinit();
 
     {

@@ -32,7 +32,7 @@ Both are part of the RAF type, so define the type once near the top of your file
 
 ```zig
 const std = @import("std");
-const aegis = @import("aegis_stream");
+const aegis = @import("aegis_raf");
 
 const Raf = aegis.Aegis128LRaf(aegis.MemoryStorage);
 

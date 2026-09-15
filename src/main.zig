@@ -1,8 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
-const aegis_stream = @import("aegis_stream");
+const aegis_raf = @import("aegis_raf");
 
-const RafFile = aegis_stream.Aegis128LRaf(aegis_stream.MemoryStorage);
+const RafFile = aegis_raf.Aegis128LRaf(aegis_raf.MemoryStorage);
 
 // A short demo: it creates a RAF file in memory, writes a message, reopens
 // the file, and reads the message back. Run it by hand with `zig build run`.
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var key: [RafFile.key_length]u8 = undefined;
     random.bytes(&key);
 
-    var storage = aegis_stream.MemoryStorage.init(gpa);
+    var storage = aegis_raf.MemoryStorage.init(gpa);
     const message = "Hello from AEGIS-RAF!";
 
     {

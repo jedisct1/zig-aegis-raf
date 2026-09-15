@@ -443,16 +443,16 @@ test "deriveMasterKey: context longer than the KDF block rejects instead of over
     _ = try raf.deriveMasterKey(32, &master_key32, context_73[0..72]);
 }
 
-// A backing store that can be told to fail the next header write (always at
-// offset 0) or the next length change, to test that a failed mutation marks
-// the context failed instead of leaving it looking usable.
+// A backing store that can be told to refuse or tear one write, or to fail one length change.
 const FailingStorage = struct {
     pub const Error = raf.MemoryStorage.Error || error{InjectedFailure};
 
     inner: raf.MemoryStorage,
-    fail_next_header_write: bool = false,
     partially_fail_next_header_write: bool = false,
     fail_next_shrink: bool = false,
+    // The next write that starts at this offset is refused as a whole.
+    // The header is at offset 0, a chunk record at its `chunkOffset`.
+    fail_next_write_at: ?u64 = null,
 
     fn deinit(self: *FailingStorage) void {
         self.inner.deinit();
@@ -468,11 +468,23 @@ const FailingStorage = struct {
             try self.inner.writePositionalAll(bytes[0..24], offset);
             return error.InjectedFailure;
         }
-        if (offset == 0 and self.fail_next_header_write) {
-            self.fail_next_header_write = false;
+        if (self.fail_next_write_at == offset) {
+            self.fail_next_write_at = null;
             return error.InjectedFailure;
         }
         return self.inner.writePositionalAll(bytes, offset);
+    }
+
+    pub fn readPositionalVecAll(self: *FailingStorage, buffers: [][]u8, offset: u64) Error!usize {
+        return self.inner.readPositionalVecAll(buffers, offset);
+    }
+
+    pub fn writePositionalVecAll(self: *FailingStorage, buffers: [][]const u8, offset: u64) Error!void {
+        if (self.fail_next_write_at == offset) {
+            self.fail_next_write_at = null;
+            return error.InjectedFailure;
+        }
+        return self.inner.writePositionalVecAll(buffers, offset);
     }
 
     pub fn length(self: *FailingStorage) Error!u64 {
@@ -502,7 +514,7 @@ test "aegis128l_raf: a failed write requires reopen and does not lose data" {
     var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 4096 }, &key);
     defer ctx.close();
 
-    storage.fail_next_header_write = true;
+    storage.fail_next_write_at = 0;
     try testing.expectError(error.InjectedFailure, ctx.write("hello", 0));
 
     // The write may have left a chunk record on disk without a header that
@@ -597,7 +609,7 @@ test "aegis128l_raf: a failed shrink requires reopen and does not lose data" {
     random.bytes(&data);
     _ = try ctx.write(&data, 0);
 
-    storage.fail_next_header_write = true;
+    storage.fail_next_write_at = 0;
     try testing.expectError(error.InjectedFailure, ctx.setLength(500));
     try testing.expectError(error.ContextFailed, ctx.setLength(500));
 
@@ -720,12 +732,20 @@ test "aegis128l_raf: FileStorage round-trips through a real file" {
     defer file.close(io);
     var storage = raf.FileStorage.init(file, io);
 
+    // 70 chunks: more than one run on both paths.
+    const data = try testing.allocator.alloc(u8, 70 * 1024 + 3);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 13);
+
+    const buf = try testing.allocator.dupe(u8, data);
+    defer testing.allocator.free(buf);
+
     const key = newKey(RafT);
 
     {
-        var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 4096 }, &key);
+        var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
         defer ctx.close();
-        _ = try ctx.write("Hello from a real file", 0);
+        try testing.expectEqual(buf.len, try ctx.writeInPlace(buf, 0));
     }
 
     // Reopen to confirm the header and chunks actually made it to disk,
@@ -733,9 +753,10 @@ test "aegis128l_raf: FileStorage round-trips through a real file" {
     var ctx = try RafT.open(testing.allocator, &storage, random, &key);
     defer ctx.close();
 
-    var buf: [64]u8 = undefined;
-    const n = try ctx.read(&buf, 0);
-    try testing.expectEqualSlices(u8, "Hello from a real file", buf[0..n]);
+    const out = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(data.len, try ctx.read(out, 0));
+    try testing.expectEqualSlices(u8, data, out);
 }
 
 test "all variants round-trip" {
@@ -745,4 +766,126 @@ test "all variants round-trip" {
     try roundTrip(raf.Aegis256Raf, 1024);
     try roundTrip(raf.Aegis256X2Raf, 1024);
     try roundTrip(raf.Aegis256X4Raf, 1024);
+}
+
+test "aegis128x2_raf: whole chunks decrypt straight into the caller's buffer" {
+    const RafT = raf.Aegis128X2Raf(raf.MemoryStorage);
+
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    // 200 chunks: more than one run, plus a partial chunk at the end.
+    const data = try testing.allocator.alloc(u8, 200 * 1024 + 7);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+    try testing.expectEqual(data.len, try ctx.write(data, 0));
+
+    const out = try testing.allocator.alloc(u8, data.len + 100);
+    defer testing.allocator.free(out);
+
+    try testing.expectEqual(data.len, try ctx.read(out, 0));
+    try testing.expectEqualSlices(u8, data, out[0..data.len]);
+}
+
+test "aegis128x2_raf: writeInPlace round-trips and leaves ciphertext behind" {
+    const RafT = raf.Aegis128X2Raf(raf.MemoryStorage);
+
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    const data = try testing.allocator.alloc(u8, 100 * 1024 + 7);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 17);
+
+    const buf = try testing.allocator.dupe(u8, data);
+    defer testing.allocator.free(buf);
+
+    const key = newKey(RafT);
+    {
+        var ctx = try RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024 }, &key);
+        defer ctx.close();
+        // Unaligned start and end: a partial chunk on both sides of the whole ones.
+        try testing.expectEqual(buf.len, try ctx.writeInPlace(buf, 500));
+    }
+
+    // Whole chunks were encrypted where they were, the partial one at the start was not.
+    try testing.expect(!std.mem.eql(u8, data[524..][0..1024], buf[524..][0..1024]));
+    try testing.expectEqualSlices(u8, data[0..524], buf[0..524]);
+
+    var ctx = try RafT.open(testing.allocator, &mem, random, &key);
+    defer ctx.close();
+    try testing.expectEqual(500 + data.len, ctx.length());
+
+    const out = try testing.allocator.alloc(u8, 500 + data.len);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(out.len, try ctx.read(out, 0));
+    const zeros: [500]u8 = @splat(0);
+    try testing.expectEqualSlices(u8, &zeros, out[0..500]);
+    try testing.expectEqualSlices(u8, data, out[500..]);
+}
+
+test "aegis128x2_raf: a damaged record fails a whole-chunk read" {
+    const RafT = raf.Aegis128X2Raf(raf.MemoryStorage);
+
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    const data = try testing.allocator.alloc(u8, 8 * 1024);
+    defer testing.allocator.free(data);
+    @memset(data, 0x5a);
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+    _ = try ctx.write(data, 0);
+
+    // One byte of the ciphertext of chunk 3.
+    const record: usize = @intCast(RafT.chunkOffset(1024, 3));
+    mem.bytes.items[record + RafT.nonce_length + 10] ^= 1;
+
+    const out = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.AuthenticationFailed, ctx.read(out, 0));
+
+    // The chunks before the damaged one still read on their own.
+    try testing.expectEqual(3 * 1024, try ctx.read(out[0 .. 3 * 1024], 0));
+    try testing.expectEqualSlices(u8, data[0 .. 3 * 1024], out[0 .. 3 * 1024]);
+}
+
+test "aegis128l_raf: a record write that fails as a whole leaves every chunk readable" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    const old: [2048]u8 = @splat('o');
+    try testing.expectEqual(old.len, try ctx.write(&old, 0));
+
+    // No write ever starts inside a record, so a trap there never springs.
+    var fresh: [2048]u8 = @splat('n');
+    storage.fail_next_write_at = RafT.chunkOffset(1024, 1) + RafT.nonce_length;
+    try testing.expectEqual(fresh.len, try ctx.writeInPlace(&fresh, 0));
+    try testing.expect(storage.fail_next_write_at != null);
+    storage.fail_next_write_at = null;
+
+    // A run that is refused as a whole leaves the previous records in place.
+    fresh = @splat('p');
+    storage.fail_next_write_at = RafT.chunkOffset(1024, 0);
+    try testing.expectError(error.InjectedFailure, ctx.writeInPlace(&fresh, 0));
+
+    ctx.close();
+    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+
+    var out: [2048]u8 = undefined;
+    try testing.expectEqual(out.len, try ctx.read(&out, 0));
+    const expected: [2048]u8 = @splat('n');
+    try testing.expectEqualSlices(u8, &expected, &out);
 }

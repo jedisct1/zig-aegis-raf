@@ -105,6 +105,8 @@ defer raf.close();
 `FileStorage` borrows the file handle rather than taking ownership of it.
 Keep the file open for the lifetime of the `raf` value, then close it yourself.
 
+A storage type of your own implements the same methods as `MemoryStorage`, with the same signatures. The doc comment on `MemoryStorage` in `src/raf.zig` is the contract.
+
 ## Keys
 
 The master key protects the file.
@@ -181,11 +183,15 @@ Each read or write takes a byte offset from the beginning of the file.
 
 `read` returns the number of bytes read, which may be smaller than the requested length at the end of the file.
 
-`write` writes the entire input and grows the file when necessary.
+`write` writes the entire input and grows the file when necessary. `writeInPlace` does the same with a buffer you no longer need: it encrypts the data where it is, so the buffer holds ciphertext afterwards.
+
+After a `read` that returns an error, treat the output buffer as undefined.
 
 Call `sync` when the data must be flushed to disk.
 
-Call `close` when finished to wipe the keys from memory and free the working buffers.
+Call `close` when finished to wipe the keys from memory and free the working buffer.
+
+Every call that grows the file also rewrites the header, with a recovery copy written and removed around it. That fixed cost is small next to a few megabytes of data, so stream large files in pieces of several megabytes rather than one chunk at a time.
 
 ## Looking at a file without the key
 

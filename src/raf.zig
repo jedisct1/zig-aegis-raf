@@ -9,6 +9,10 @@
 //! One piece of libaegis is missing here: the optional Merkle-tree commitment feature.
 //! It only touches a buffer the caller provides, and it is never written to the file, so leaving it out does not affect compatibility.
 //! It can be added later without touching anything below.
+//!
+//! Whole chunks never pass through an internal buffer.
+//! `read` decrypts them inside the caller's buffer, and `writeInPlace` encrypts them there.
+//! Only a partial chunk, at either end of a request, goes through the scratch buffer.
 const std = @import("std");
 const aegis_aead = std.crypto.aead.aegis;
 const aegis_mac = std.crypto.auth.aegis;
@@ -22,6 +26,9 @@ pub const version = 1;
 
 pub const chunk_size_min = 1024;
 pub const chunk_size_max = 1 << 20;
+
+// The most chunks one run moves at once, which bounds the stack space of a run.
+const max_run = 64;
 
 /// The AEGIS variant a RAF file was encrypted with, stored as a single byte in its header.
 pub const AlgId = enum(u8) {
@@ -38,10 +45,14 @@ pub const AlgId = enum(u8) {
 ///
 /// This also works as the reference implementation of the storage interface
 /// `Raf()` expects as a type parameter: a type with a `pub const Error`, plus
-/// `readPositionalAll`, `writePositionalAll`, `length`, `setLength`, and
-/// `sync` methods matching the ones below.
+/// `readPositionalAll`, `writePositionalAll`, `readPositionalVecAll`,
+/// `writePositionalVecAll`, `length`, `setLength`, and `sync` methods
+/// matching the ones below.
 /// Naming and short-read behavior mirror `std.Io.File`.
 /// `FileStorage` below is the same interface, backed by a real file instead of memory.
+///
+/// The vectored pair moves several buffers with one call and may shorten the entries of the slice it receives.
+/// A vectored write that fails must leave the store untouched, so this one checks the whole range before it copies.
 pub const MemoryStorage = struct {
     pub const Error = std.mem.Allocator.Error || error{OutOfBounds};
 
@@ -73,6 +84,29 @@ pub const MemoryStorage = struct {
         const start: usize = @intCast(offset);
         if (bytes.len > self.bytes.items.len - start) return error.OutOfBounds;
         @memcpy(self.bytes.items[start..][0..bytes.len], bytes);
+    }
+
+    pub fn readPositionalVecAll(self: *MemoryStorage, buffers: [][]u8, offset: u64) Error!usize {
+        var total: usize = 0;
+        for (buffers) |buffer| {
+            const n = try self.readPositionalAll(buffer, offset + total);
+            total += n;
+            if (n != buffer.len) break;
+        }
+        return total;
+    }
+
+    pub fn writePositionalVecAll(self: *MemoryStorage, buffers: [][]const u8, offset: u64) Error!void {
+        var total: u64 = 0;
+        for (buffers) |bytes| total += bytes.len;
+        if (offset > self.bytes.items.len) return error.OutOfBounds;
+        if (total > self.bytes.items.len - offset) return error.OutOfBounds;
+
+        var pos: usize = @intCast(offset);
+        for (buffers) |bytes| {
+            @memcpy(self.bytes.items[pos..][0..bytes.len], bytes);
+            pos += bytes.len;
+        }
     }
 
     pub fn length(self: *MemoryStorage) Error!u64 {
@@ -119,6 +153,40 @@ pub const FileStorage = struct {
 
     pub fn writePositionalAll(self: *FileStorage, bytes: []const u8, offset: u64) Error!void {
         return self.file.writePositionalAll(self.io, bytes, offset);
+    }
+
+    pub fn readPositionalVecAll(self: *FileStorage, buffers: [][]u8, offset: u64) Error!usize {
+        var remaining = buffers;
+        var total: usize = 0;
+        while (remaining.len != 0) {
+            const n = try self.file.readPositional(self.io, remaining, offset + total);
+            if (n == 0) break;
+            total += n;
+            remaining = advance([]u8, remaining, n);
+        }
+        return total;
+    }
+
+    pub fn writePositionalVecAll(self: *FileStorage, buffers: [][]const u8, offset: u64) Error!void {
+        var remaining = buffers;
+        var total: u64 = 0;
+        while (remaining.len != 0) {
+            const n = try self.file.writePositional(self.io, remaining, offset + total);
+            total += n;
+            remaining = advance([]const u8, remaining, n);
+        }
+    }
+
+    // What is left to move once `n` bytes went through.
+    fn advance(comptime Slice: type, buffers: []Slice, n: usize) []Slice {
+        var remaining = buffers;
+        var skip = n;
+        while (remaining.len != 0 and skip >= remaining[0].len) {
+            skip -= remaining[0].len;
+            remaining = remaining[1..];
+        }
+        if (remaining.len != 0) remaining[0] = remaining[0][skip..];
+        return remaining;
     }
 
     pub fn length(self: *FileStorage) Error!u64 {
@@ -315,16 +383,16 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         // instead of rebuilt on every read or write.
         aad: [aad_bytes]u8,
 
-        // Reused across every chunk operation, to avoid an allocation per read/write call.
-        // Freed and zeroized in `close()`.
-        record_buf: []u8,
+        // Scratch for a partial chunk, zeroized in `close()`.
         chunk_buf: []u8,
 
-        fn recordSize(chunk_size: u32) u64 {
+        /// Bytes one record takes on disk: nonce, ciphertext of one chunk, tag.
+        pub fn recordSize(chunk_size: u32) u64 {
             return nonce_length + chunk_size + tag_bytes;
         }
 
-        fn chunkOffset(chunk_size: u32, chunk_idx: u64) u64 {
+        /// Where the record of a chunk starts in the file.
+        pub fn chunkOffset(chunk_size: u32, chunk_idx: u64) u64 {
             return header_size + chunk_idx * recordSize(chunk_size);
         }
 
@@ -347,13 +415,6 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             }
             @memcpy(enc_key, key_material[0..key_length]);
             @memcpy(hdr_key, key_material[key_length..]);
-        }
-
-        fn allocScratch(allocator: std.mem.Allocator, chunk_size: u32) !struct { record_buf: []u8, chunk_buf: []u8 } {
-            const record_buf = try allocator.alloc(u8, @intCast(recordSize(chunk_size)));
-            errdefer allocator.free(record_buf);
-            const chunk_buf = try allocator.alloc(u8, chunk_size);
-            return .{ .record_buf = record_buf, .chunk_buf = chunk_buf };
         }
 
         // Takes the file size explicitly, so the header can be committed to
@@ -426,41 +487,66 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             return parsed;
         }
 
+        // Decrypts up to `max_run` whole chunks straight into `out`. Returns the bytes read.
+        fn readRun(self: *Self, out: []u8, first_idx: u64) Error!usize {
+            const count: usize = @min(out.len / self.chunk_size, max_run);
+            var nonces: [max_run][nonce_length]u8 = undefined;
+            var tags: [max_run][tag_bytes]u8 = undefined;
+            var buffers: [max_run * 3][]u8 = undefined;
+
+            for (0..count) |i| {
+                buffers[i * 3] = &nonces[i];
+                buffers[i * 3 + 1] = out[i * self.chunk_size ..][0..self.chunk_size];
+                buffers[i * 3 + 2] = &tags[i];
+            }
+
+            const got = try self.storage.readPositionalVecAll(buffers[0 .. count * 3], chunkOffset(self.chunk_size, first_idx));
+            if (got != count * recordSize(self.chunk_size)) return error.ShortRead;
+
+            for (0..count) |i| {
+                const chunk = out[i * self.chunk_size ..][0..self.chunk_size];
+                std.mem.writeInt(u64, self.aad[file_id_bytes..][0..8], first_idx + i, .little);
+                Aead.decrypt(chunk, chunk, tags[i], &self.aad, nonces[i], self.enc_key) catch {
+                    return error.AuthenticationFailed;
+                };
+            }
+            return count * self.chunk_size;
+        }
+
         fn readChunk(self: *Self, chunk_idx: u64) Error!void {
-            const off = chunkOffset(self.chunk_size, chunk_idx);
-            const n = try self.storage.readPositionalAll(self.record_buf, off);
-            if (n != self.record_buf.len) return error.ShortRead;
+            _ = try self.readRun(self.chunk_buf, chunk_idx);
+        }
 
-            const nonce = self.record_buf[0..nonce_length];
-            const ciphertext = self.record_buf[nonce_length..][0..self.chunk_size];
-            const tag = self.record_buf[nonce_length + self.chunk_size ..][0..tag_bytes];
+        // Encrypts up to `max_run` whole chunks of `src` into `dst`, which may be `src` itself. Returns the bytes consumed.
+        fn writeRun(self: *Self, dst: []u8, src: []const u8, first_idx: u64) Error!usize {
+            const count: usize = @min(dst.len / self.chunk_size, max_run);
+            std.debug.assert(src.len >= count * self.chunk_size);
+            var nonces: [max_run][nonce_length]u8 = undefined;
+            var tags: [max_run][tag_bytes]u8 = undefined;
+            var buffers: [max_run * 3][]const u8 = undefined;
 
-            std.mem.writeInt(u64, self.aad[file_id_bytes..][0..8], chunk_idx, .little);
+            // One draw per run: a draw has a fixed cost that shows with small chunks.
+            self.random.bytes(std.mem.sliceAsBytes(nonces[0..count]));
 
-            Aead.decrypt(self.chunk_buf, ciphertext, tag.*, &self.aad, nonce.*, self.enc_key) catch {
-                return error.AuthenticationFailed;
-            };
+            for (0..count) |i| {
+                const ciphertext = dst[i * self.chunk_size ..][0..self.chunk_size];
+                const plaintext = src[i * self.chunk_size ..][0..self.chunk_size];
+                std.mem.writeInt(u64, self.aad[file_id_bytes..][0..8], first_idx + i, .little);
+                Aead.encrypt(ciphertext, &tags[i], plaintext, &self.aad, nonces[i], self.enc_key);
+                buffers[i * 3] = &nonces[i];
+                buffers[i * 3 + 1] = ciphertext;
+                buffers[i * 3 + 2] = &tags[i];
+            }
+
+            try self.storage.writePositionalVecAll(buffers[0 .. count * 3], chunkOffset(self.chunk_size, first_idx));
+            return count * self.chunk_size;
         }
 
         fn writeChunk(self: *Self, plaintext_len: usize, chunk_idx: u64) Error!void {
             if (plaintext_len < self.chunk_size) {
                 @memset(self.chunk_buf[plaintext_len..], 0);
             }
-
-            var nonce: [nonce_length]u8 = undefined;
-            self.random.bytes(&nonce);
-
-            std.mem.writeInt(u64, self.aad[file_id_bytes..][0..8], chunk_idx, .little);
-
-            var tag: [tag_bytes]u8 = undefined;
-            const ciphertext = self.record_buf[nonce_length..][0..self.chunk_size];
-            Aead.encrypt(ciphertext, &tag, self.chunk_buf, &self.aad, nonce, self.enc_key);
-
-            @memcpy(self.record_buf[0..nonce_length], &nonce);
-            @memcpy(self.record_buf[nonce_length + self.chunk_size ..], &tag);
-
-            const off = chunkOffset(self.chunk_size, chunk_idx);
-            try self.storage.writePositionalAll(self.record_buf, off);
+            _ = try self.writeRun(self.chunk_buf, self.chunk_buf, chunk_idx);
         }
 
         /// Creates a new RAF file.
@@ -493,11 +579,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             var aad: [aad_bytes]u8 = undefined;
             buildAad(&aad, &file_id, 0, options.chunk_size);
 
-            const scratch = try allocScratch(allocator, options.chunk_size);
-            errdefer {
-                allocator.free(scratch.record_buf);
-                allocator.free(scratch.chunk_buf);
-            }
+            const chunk_buf = try allocator.alloc(u8, options.chunk_size);
+            errdefer allocator.free(chunk_buf);
 
             try storage.setLength(header_size);
 
@@ -512,8 +595,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                 .chunk_size = options.chunk_size,
                 .recovered_header = false,
                 .aad = aad,
-                .record_buf = scratch.record_buf,
-                .chunk_buf = scratch.chunk_buf,
+                .chunk_buf = chunk_buf,
             };
             try self.writeHeader(0);
             return self;
@@ -567,11 +649,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             var aad: [aad_bytes]u8 = undefined;
             buildAad(&aad, &file_id, 0, parsed.chunk_size);
 
-            const scratch = try allocScratch(allocator, parsed.chunk_size);
-            errdefer {
-                allocator.free(scratch.record_buf);
-                allocator.free(scratch.chunk_buf);
-            }
+            const chunk_buf = try allocator.alloc(u8, parsed.chunk_size);
+            errdefer allocator.free(chunk_buf);
 
             return Self{
                 .allocator = allocator,
@@ -584,22 +663,26 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                 .chunk_size = parsed.chunk_size,
                 .recovered_header = recovered_header,
                 .aad = aad,
-                .record_buf = scratch.record_buf,
-                .chunk_buf = scratch.chunk_buf,
+                .chunk_buf = chunk_buf,
             };
         }
 
         /// Reads up to `out.len` bytes starting at `offset`.
         /// Returns the number of bytes actually read, which is short only at EOF.
+        /// Whole chunks are decrypted inside `out` itself, so after an error `out` holds nothing usable.
         pub fn read(self: *Self, out: []u8, offset: u64) Error!usize {
             try self.checkUsable();
             if (out.len == 0 or offset >= self.file_size) return 0;
 
-            const len = @min(out.len, self.file_size - offset);
+            const len: usize = @intCast(@min(out.len, self.file_size - offset));
 
             var total_read: usize = 0;
             while (total_read < len) {
                 const s = chunkSlice(self.chunk_size, offset + total_read, len - total_read);
+                if (s.offset == 0 and s.len == self.chunk_size) {
+                    total_read += try self.readRun(out[total_read..len], s.idx);
+                    continue;
+                }
                 try self.readChunk(s.idx);
                 @memcpy(out[total_read..][0..s.len], self.chunk_buf[s.offset..][0..s.len]);
                 total_read += s.len;
@@ -607,10 +690,10 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             return total_read;
         }
 
-        // Shared by write() and the growth path of setLength().
+        // Shared by write(), writeInPlace() and the growth path of setLength().
         // It still runs the gap-filling logic for a zero-length input, which
         // is exactly how a grow through setLength() works below.
-        fn writeImpl(self: *Self, in: []const u8, offset: u64) Error!usize {
+        fn writeImpl(self: *Self, comptime in_place: bool, in: if (in_place) []u8 else []const u8, offset: u64) Error!usize {
             const new_file_size = std.math.add(u64, offset, in.len) catch return error.Overflow;
 
             const old_num_chunks = chunkCount(self.chunk_size, self.file_size);
@@ -661,14 +744,20 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             while (total_written < in.len) {
                 const s = chunkSlice(self.chunk_size, offset + total_written, in.len - total_written);
 
-                const need_read_modify_write = s.offset != 0 or s.len < self.chunk_size;
-                if (need_read_modify_write) {
-                    const chunk_start = s.idx * self.chunk_size;
-                    if (chunk_start < self.file_size) {
-                        try self.readChunk(s.idx);
-                    } else {
-                        @memset(self.chunk_buf, 0);
-                    }
+                if (s.offset == 0 and s.len == self.chunk_size) {
+                    // A whole chunk is encrypted where it is, or through the scratch buffer when `in` must stay intact.
+                    const src = in[total_written..];
+                    const dst: []u8 = if (in_place) src else self.chunk_buf;
+                    total_written += try self.writeRun(dst, src, s.idx);
+                    continue;
+                }
+
+                // A partial chunk keeps the bytes around the request, so its record is read first unless it lies past the end.
+                const chunk_start = s.idx * self.chunk_size;
+                if (chunk_start < self.file_size) {
+                    try self.readChunk(s.idx);
+                } else {
+                    @memset(self.chunk_buf, 0);
                 }
 
                 @memcpy(self.chunk_buf[s.offset..][0..s.len], in[total_written..][0..s.len]);
@@ -700,7 +789,16 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         pub fn write(self: *Self, in: []const u8, offset: u64) Error!usize {
             try self.checkUsable();
             if (in.len == 0) return 0;
-            return self.writeImpl(in, offset);
+            return self.writeImpl(false, in, offset);
+        }
+
+        /// Like `write`, but whole chunks are encrypted inside `buf` itself and written from there, so no byte is copied.
+        /// On return every whole chunk of `buf` holds ciphertext, and a partial chunk at either end keeps its bytes.
+        /// Treat the whole buffer as consumed.
+        pub fn writeInPlace(self: *Self, buf: []u8, offset: u64) Error!usize {
+            try self.checkUsable();
+            if (buf.len == 0) return 0;
+            return self.writeImpl(true, buf, offset);
         }
 
         /// Resizes the file.
@@ -709,7 +807,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             try self.checkUsable();
 
             if (new_length > self.file_size) {
-                _ = try self.writeImpl(&.{}, new_length);
+                _ = try self.writeImpl(false, &.{}, new_length);
                 return;
             }
 
@@ -756,7 +854,6 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             std.crypto.secureZero(u8, &self.enc_key);
             std.crypto.secureZero(u8, &self.hdr_key);
             std.crypto.secureZero(u8, self.chunk_buf);
-            self.allocator.free(self.record_buf);
             self.allocator.free(self.chunk_buf);
             self.* = undefined;
         }

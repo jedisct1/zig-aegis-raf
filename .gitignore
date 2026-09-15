@@ -1,0 +1,6 @@
+*~
+.swival/
+.zig-cache/
+tmp/
+zig-out/
+

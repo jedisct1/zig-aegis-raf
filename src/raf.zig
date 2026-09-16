@@ -30,6 +30,9 @@ pub const chunk_size_max = 1 << 20;
 // The most chunks one run moves at once, which bounds the stack space of a run.
 const max_run = 64;
 
+/// Maximum scratch capacity per context, in chunks.
+pub const scratch_chunks_max = max_run;
+
 /// The AEGIS variant a RAF file was encrypted with, stored as a single byte in its header.
 pub const AlgId = enum(u8) {
     aegis128l = 1,
@@ -298,6 +301,14 @@ pub fn deriveMasterKey(comptime key_len: usize, master_key: *const [key_len]u8, 
     return out;
 }
 
+pub const OpenOptions = struct {
+    /// Scratch capacity in chunks, from 1 to `scratch_chunks_max`.
+    ///
+    /// Larger values batch `write` calls to storage at the cost of memory held until `close`.
+    /// Partial writes and `writeInPlace` need only one scratch chunk.
+    scratch_chunks: u32 = 1,
+};
+
 /// Options for creating a new RAF file.
 /// Mirrors the independent AEGIS_RAF_CREATE / AEGIS_RAF_TRUNCATE flags in libaegis, which behave like POSIX O_CREAT / O_TRUNC.
 pub const CreateOptions = struct {
@@ -307,7 +318,13 @@ pub const CreateOptions = struct {
     create: bool = true,
     /// Allows overwriting the file when it already exists.
     truncate: bool = false,
+    /// See `OpenOptions.scratch_chunks`.
+    scratch_chunks: u32 = 1,
 };
+
+fn isValidScratchChunks(scratch_chunks: u32) bool {
+    return scratch_chunks >= 1 and scratch_chunks <= scratch_chunks_max;
+}
 
 const aad_bytes = file_id_bytes + 8 + 4;
 
@@ -383,8 +400,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         // instead of rebuilt on every read or write.
         aad: [aad_bytes]u8,
 
-        // Scratch for a partial chunk, zeroized in `close()`.
-        chunk_buf: []u8,
+        // Preserves partial chunks and the caller's `write` buffer. Wiped on close.
+        scratch: []u8,
 
         /// Bytes one record takes on disk: nonce, ciphertext of one chunk, tag.
         pub fn recordSize(chunk_size: u32) u64 {
@@ -403,6 +420,10 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
 
         fn checkUsable(self: *const Self) Error!void {
             if (self.failed) return error.ContextFailed;
+        }
+
+        fn chunkBuf(self: *Self) []u8 {
+            return self.scratch[0..self.chunk_size];
         }
 
         fn deriveKeys(enc_key: *[key_length]u8, hdr_key: *[key_length]u8, master_key: *const [key_length]u8, file_id: *const [file_id_bytes]u8) void {
@@ -441,20 +462,18 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             try self.storage.writePositionalAll(&hdr, 0);
         }
 
-        // Appends the current header as a trailer before writing the new
-        // primary header. If that write tears, open() can authenticate the
-        // trailer and recover the previous state. The trailer is removed once
-        // the new header has landed, so the file matches the normal libaegis
-        // format again.
+        // Reserve new records and their recovery trailer with a single resize.
+        fn reserveTrailer(self: *Self, end: u64) Error!void {
+            const with_trailer = std.math.add(u64, end, header_size) catch return error.Overflow;
+            try self.storage.setLength(with_trailer);
+        }
+
+        // Preserve the old header in a trailer so a torn header write can recover.
+        // Remove the trailer after success to restore the libaegis format.
         //
-        // `recovery_offset` is where the trailer goes: the backing store's
-        // length right before this call. It is passed in, instead of queried
-        // here, because the growing-write caller already knows it for free.
+        // The caller must reserve trailer space first.
         fn commitHeader(self: *Self, new_file_size: u64, recovery_offset: u64, canonical_backing_size: u64) Error!void {
             const recovery_hdr = self.buildHeader(self.file_size);
-            const recovery_end = std.math.add(u64, recovery_offset, header_size) catch return error.Overflow;
-
-            try self.storage.setLength(recovery_end);
             try self.storage.writePositionalAll(&recovery_hdr, recovery_offset);
             try self.writeHeader(new_file_size);
             try self.storage.setLength(canonical_backing_size);
@@ -514,13 +533,12 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         }
 
         fn readChunk(self: *Self, chunk_idx: u64) Error!void {
-            _ = try self.readRun(self.chunk_buf, chunk_idx);
+            _ = try self.readRun(self.chunkBuf(), chunk_idx);
         }
 
-        // Encrypts up to `max_run` whole chunks of `src` into `dst`, which may be `src` itself. Returns the bytes consumed.
+        // Allows in-place encryption and returns the number of bytes consumed.
         fn writeRun(self: *Self, dst: []u8, src: []const u8, first_idx: u64) Error!usize {
-            const count: usize = @min(dst.len / self.chunk_size, max_run);
-            std.debug.assert(src.len >= count * self.chunk_size);
+            const count: usize = @min(@min(dst.len, src.len) / self.chunk_size, max_run);
             var nonces: [max_run][nonce_length]u8 = undefined;
             var tags: [max_run][tag_bytes]u8 = undefined;
             var buffers: [max_run * 3][]const u8 = undefined;
@@ -543,10 +561,9 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         }
 
         fn writeChunk(self: *Self, plaintext_len: usize, chunk_idx: u64) Error!void {
-            if (plaintext_len < self.chunk_size) {
-                @memset(self.chunk_buf[plaintext_len..], 0);
-            }
-            _ = try self.writeRun(self.chunk_buf, self.chunk_buf, chunk_idx);
+            const chunk = self.chunkBuf();
+            @memset(chunk[plaintext_len..], 0);
+            _ = try self.writeRun(chunk, chunk, chunk_idx);
         }
 
         /// Creates a new RAF file.
@@ -559,7 +576,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             options: CreateOptions,
             master_key: *const [key_length]u8,
         ) Error!Self {
-            if (!isValidChunkSize(options.chunk_size)) return error.InvalidArgument;
+            if (!isValidChunkSize(options.chunk_size) or !isValidScratchChunks(options.scratch_chunks)) return error.InvalidArgument;
 
             const backing_size = try storage.length();
             // Any nonempty backing store counts as an existing file. A short or
@@ -579,8 +596,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             var aad: [aad_bytes]u8 = undefined;
             buildAad(&aad, &file_id, 0, options.chunk_size);
 
-            const chunk_buf = try allocator.alloc(u8, options.chunk_size);
-            errdefer allocator.free(chunk_buf);
+            const scratch = try allocator.alloc(u8, options.chunk_size * options.scratch_chunks);
+            errdefer allocator.free(scratch);
 
             try storage.setLength(header_size);
 
@@ -595,10 +612,68 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                 .chunk_size = options.chunk_size,
                 .recovered_header = false,
                 .aad = aad,
-                .chunk_buf = chunk_buf,
+                .scratch = scratch,
             };
             try self.writeHeader(0);
             return self;
+        }
+
+        // Authenticated metadata and keys; wipe the keys after use.
+        const Header = struct {
+            info: Info,
+            file_id: [file_id_bytes]u8,
+            enc_key: [key_length]u8,
+            hdr_key: [key_length]u8,
+            // The recovery trailer supplied the authenticated header.
+            recovered: bool,
+
+            fn zeroize(header: *Header) void {
+                std.crypto.secureZero(u8, &header.enc_key);
+                std.crypto.secureZero(u8, &header.hdr_key);
+            }
+        };
+
+        // Fall back to the recovery trailer and reject headers that claim missing records.
+        fn authenticateHeader(storage: *Storage, master_key: *const [key_length]u8) Error!Header {
+            const backing_size = try storage.length();
+            if (backing_size < header_size) return error.InvalidHeader;
+
+            var hdr: [header_size]u8 = undefined;
+            const n = try storage.readPositionalAll(&hdr, 0);
+            if (n != hdr.len) return error.InvalidHeader;
+
+            var header: Header = .{
+                .info = undefined,
+                .file_id = hdr[24..48].*,
+                .enc_key = undefined,
+                .hdr_key = undefined,
+                .recovered = false,
+            };
+            errdefer header.zeroize();
+            var authenticated_backing_size = backing_size;
+            deriveKeys(&header.enc_key, &header.hdr_key, master_key, &header.file_id);
+
+            header.info = verifyHeader(&hdr, &header.hdr_key) catch |primary_error| recover: {
+                if (backing_size < header_size * 2) return primary_error;
+
+                const recovery_offset = backing_size - header_size;
+                var recovery_hdr: [header_size]u8 = undefined;
+                const recovery_n = try storage.readPositionalAll(&recovery_hdr, recovery_offset);
+                if (recovery_n != recovery_hdr.len) return primary_error;
+
+                header.file_id = recovery_hdr[24..48].*;
+                deriveKeys(&header.enc_key, &header.hdr_key, master_key, &header.file_id);
+                const recovery_info = verifyHeader(&recovery_hdr, &header.hdr_key) catch return primary_error;
+
+                header.recovered = true;
+                authenticated_backing_size = recovery_offset;
+                break :recover recovery_info;
+            };
+
+            const max_chunks = chunkCount(header.info.chunk_size, header.info.file_size);
+            const backing_needed = try backingSizeForChunks(header.info.chunk_size, max_chunks);
+            if (authenticated_backing_size < backing_needed) return error.InvalidHeader;
+            return header;
         }
 
         /// Opens an existing RAF file, authenticating its header with a key derived from `master_key` and the file's own file_id.
@@ -607,70 +682,53 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             allocator: std.mem.Allocator,
             storage: *Storage,
             random: std.Random,
+            options: OpenOptions,
             master_key: *const [key_length]u8,
         ) Error!Self {
-            const backing_size = try storage.length();
-            if (backing_size < header_size) return error.InvalidHeader;
+            if (!isValidScratchChunks(options.scratch_chunks)) return error.InvalidArgument;
 
-            var hdr: [header_size]u8 = undefined;
-            const n = try storage.readPositionalAll(&hdr, 0);
-            if (n != hdr.len) return error.InvalidHeader;
-
-            var enc_key: [key_length]u8 = undefined;
-            var hdr_key: [key_length]u8 = undefined;
-            var file_id: [file_id_bytes]u8 = undefined;
-            var recovered_header = false;
-            var authenticated_backing_size = backing_size;
-
-            @memcpy(&file_id, hdr[24..48]);
-            deriveKeys(&enc_key, &hdr_key, master_key, &file_id);
-
-            const parsed = verifyHeader(&hdr, &hdr_key) catch |primary_error| recover: {
-                if (backing_size < header_size * 2) return primary_error;
-
-                const recovery_offset = backing_size - header_size;
-                var recovery_hdr: [header_size]u8 = undefined;
-                const recovery_n = try storage.readPositionalAll(&recovery_hdr, recovery_offset);
-                if (recovery_n != recovery_hdr.len) return primary_error;
-
-                @memcpy(&file_id, recovery_hdr[24..48]);
-                deriveKeys(&enc_key, &hdr_key, master_key, &file_id);
-                const recovery_parsed = verifyHeader(&recovery_hdr, &hdr_key) catch return primary_error;
-
-                recovered_header = true;
-                authenticated_backing_size = recovery_offset;
-                break :recover recovery_parsed;
-            };
-
-            const max_chunks = chunkCount(parsed.chunk_size, parsed.file_size);
-            const backing_needed = try backingSizeForChunks(parsed.chunk_size, max_chunks);
-            if (authenticated_backing_size < backing_needed) return error.InvalidHeader;
+            var header = try authenticateHeader(storage, master_key);
+            defer header.zeroize();
 
             var aad: [aad_bytes]u8 = undefined;
-            buildAad(&aad, &file_id, 0, parsed.chunk_size);
+            buildAad(&aad, &header.file_id, 0, header.info.chunk_size);
 
-            const chunk_buf = try allocator.alloc(u8, parsed.chunk_size);
-            errdefer allocator.free(chunk_buf);
+            const scratch = try allocator.alloc(u8, header.info.chunk_size * options.scratch_chunks);
 
             return Self{
                 .allocator = allocator,
                 .storage = storage,
                 .random = random,
-                .enc_key = enc_key,
-                .hdr_key = hdr_key,
-                .file_id = file_id,
-                .file_size = parsed.file_size,
-                .chunk_size = parsed.chunk_size,
-                .recovered_header = recovered_header,
+                .enc_key = header.enc_key,
+                .hdr_key = header.hdr_key,
+                .file_id = header.file_id,
+                .file_size = header.info.file_size,
+                .chunk_size = header.info.chunk_size,
+                .recovered_header = header.recovered,
                 .aad = aad,
-                .chunk_buf = chunk_buf,
+                .scratch = scratch,
             };
+        }
+
+        /// Returns authenticated file metadata without allocating, retaining keys, or modifying storage.
+        /// Like `open`, accepts a recovery trailer if the primary header is torn.
+        pub fn verify(storage: *Storage, master_key: *const [key_length]u8) Error!Info {
+            var header = try authenticateHeader(storage, master_key);
+            header.zeroize();
+            return header.info;
         }
 
         /// Reads up to `out.len` bytes starting at `offset`.
         /// Returns the number of bytes actually read, which is short only at EOF.
-        /// Whole chunks are decrypted inside `out` itself, so after an error `out` holds nothing usable.
+        /// Zeroes all of `out` on error to avoid exposing unauthenticated data.
         pub fn read(self: *Self, out: []u8, offset: u64) Error!usize {
+            return self.readImpl(out, offset) catch |err| {
+                @memset(out, 0);
+                return err;
+            };
+        }
+
+        fn readImpl(self: *Self, out: []u8, offset: u64) Error!usize {
             try self.checkUsable();
             if (out.len == 0 or offset >= self.file_size) return 0;
 
@@ -684,7 +742,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                     continue;
                 }
                 try self.readChunk(s.idx);
-                @memcpy(out[total_read..][0..s.len], self.chunk_buf[s.offset..][0..s.len]);
+                @memcpy(out[total_read..][0..s.len], self.chunkBuf()[s.offset..][0..s.len]);
                 total_read += s.len;
             }
             return total_read;
@@ -707,7 +765,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             self.failed = true;
 
             if (new_file_size > self.file_size) {
-                try self.storage.setLength(new_backing_size);
+                try self.reserveTrailer(new_backing_size);
             }
 
             if (offset > self.file_size) {
@@ -724,12 +782,12 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                     if (ci < old_num_chunks) {
                         try self.readChunk(ci);
                     } else {
-                        @memset(self.chunk_buf, 0);
+                        @memset(self.chunkBuf(), 0);
                     }
 
                     const zero_start: u32 = if (gap_start > chunk_start) @intCast(gap_start - chunk_start) else 0;
                     const zero_end: u32 = if (gap_end < chunk_end) @intCast(gap_end - chunk_start) else self.chunk_size;
-                    if (zero_end > zero_start) @memset(self.chunk_buf[zero_start..zero_end], 0);
+                    if (zero_end > zero_start) @memset(self.chunkBuf()[zero_start..zero_end], 0);
 
                     const chunk_valid_len: u32 = if (chunk_end <= new_file_size)
                         self.chunk_size
@@ -745,9 +803,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                 const s = chunkSlice(self.chunk_size, offset + total_written, in.len - total_written);
 
                 if (s.offset == 0 and s.len == self.chunk_size) {
-                    // A whole chunk is encrypted where it is, or through the scratch buffer when `in` must stay intact.
                     const src = in[total_written..];
-                    const dst: []u8 = if (in_place) src else self.chunk_buf;
+                    const dst: []u8 = if (in_place) src else self.scratch;
                     total_written += try self.writeRun(dst, src, s.idx);
                     continue;
                 }
@@ -757,10 +814,10 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
                 if (chunk_start < self.file_size) {
                     try self.readChunk(s.idx);
                 } else {
-                    @memset(self.chunk_buf, 0);
+                    @memset(self.chunkBuf(), 0);
                 }
 
-                @memcpy(self.chunk_buf[s.offset..][0..s.len], in[total_written..][0..s.len]);
+                @memcpy(self.chunkBuf()[s.offset..][0..s.len], in[total_written..][0..s.len]);
 
                 const effective_file_size = @max(new_file_size, self.file_size);
                 const chunk_end_offset = (s.idx + 1) * self.chunk_size;
@@ -774,8 +831,6 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             }
 
             if (new_file_size > self.file_size) {
-                // Storage was just resized to new_backing_size above, so that
-                // is already its current length: no need to ask it again.
                 try self.commitHeader(new_file_size, new_backing_size, new_backing_size);
                 self.file_size = new_file_size;
             }
@@ -832,6 +887,7 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
             // unused trailing chunk records.
             self.failed = true;
             const recovery_offset = try self.storage.length();
+            try self.reserveTrailer(recovery_offset);
             try self.commitHeader(new_length, recovery_offset, new_backing_size);
             self.file_size = new_length;
             self.failed = false;
@@ -853,8 +909,8 @@ pub fn Raf(comptime Aead: type, comptime Mac: type, comptime alg_id: AlgId, comp
         pub fn close(self: *Self) void {
             std.crypto.secureZero(u8, &self.enc_key);
             std.crypto.secureZero(u8, &self.hdr_key);
-            std.crypto.secureZero(u8, self.chunk_buf);
-            self.allocator.free(self.chunk_buf);
+            std.crypto.secureZero(u8, self.scratch);
+            self.allocator.free(self.scratch);
             self.* = undefined;
         }
     };

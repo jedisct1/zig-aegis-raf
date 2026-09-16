@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try raf.write("Hello from AEGIS-RAF!", 0);
     }
 
-    var raf = try Raf.open(gpa, &storage, random, &key);
+    var raf = try Raf.open(gpa, &storage, random, .{}, &key);
     defer raf.close();
 
     var buf: [64]u8 = undefined;
@@ -138,11 +138,12 @@ A longer label returns `error.ContextTooLong`.
 
 Choose the chunk size when creating the file. It can't be changed later.
 
-| Option       | Default | Meaning                                            |
-| ------------ | ------- | -------------------------------------------------- |
-| `chunk_size` | none    | Required. 1024 to 1048576 bytes, a multiple of 16. |
-| `create`     | `true`  | Allow creating the file when it doesn't exist.     |
-| `truncate`   | `false` | Allow overwriting the file when it already exists. |
+| Option           | Default | Meaning                                                             |
+| ---------------- | ------- | ------------------------------------------------------------------- |
+| `chunk_size`     | none    | Required. 1024 to 1048576 bytes, a multiple of 16.                  |
+| `create`         | `true`  | Allow creating the file when it doesn't exist.                      |
+| `truncate`       | `false` | Allow overwriting the file when it already exists.                  |
+| `scratch_chunks` | `1`     | Chunks the scratch buffer holds. See [Large writes](#large-writes). |
 
 `create` and `truncate` behave like the `O_CREAT` and `O_TRUNC` flags.
 Any existing destination counts as a file, even if it isn't in RAF format.
@@ -159,7 +160,7 @@ The example uses 4096 bytes, which is a reasonable starting point.
 ## Reading and writing
 
 ```zig
-var raf = try Raf.open(gpa, &storage, random, &key);
+var raf = try Raf.open(gpa, &storage, random, .{}, &key);
 defer raf.close();
 
 // Overwrite bytes 1024 through 1033.
@@ -185,13 +186,23 @@ Each read or write takes a byte offset from the beginning of the file.
 
 `write` writes the entire input and grows the file when necessary. `writeInPlace` does the same with a buffer you no longer need: it encrypts the data where it is, so the buffer holds ciphertext afterwards.
 
-After a `read` that returns an error, treat the output buffer as undefined.
+After a `read` that returns an error, the output buffer holds zeros.
 
 Call `sync` when the data must be flushed to disk.
 
 Call `close` when finished to wipe the keys from memory and free the working buffer.
 
+## Large writes
+
 Every call that grows the file also rewrites the header, with a recovery copy written and removed around it. That fixed cost is small next to a few megabytes of data, so stream large files in pieces of several megabytes rather than one chunk at a time.
+
+`write` keeps your buffer intact, so it encrypts whole chunks into a scratch buffer before it stores them. By default the scratch holds one chunk, and a large write reaches the storage one record at a time. Open or create the file with a larger scratch to store several records per call:
+
+```zig
+var raf = try Raf.open(gpa, &storage, random, .{ .scratch_chunks = 8 }, &key);
+```
+
+The scratch costs that many chunks of memory for as long as the file is open, up to `scratch_chunks_max`. It's a property of the open file, not of the file format, so any value works on any file. `writeInPlace` never needs more than one chunk.
 
 ## Looking at a file without the key
 
@@ -206,7 +217,15 @@ switch (info.alg_id) {
 ```
 
 `probe` doesn't authenticate the metadata, so treat its result only as a hint.
-Use `open` to verify the file with a key.
+
+With the key, `verify` checks the header and returns the same information, without opening the file:
+
+```zig
+const info = try Raf.verify(&storage, &key);
+std.debug.print("{d} bytes\n", .{info.file_size});
+```
+
+It's the cheap way to learn the size of a file: nothing is allocated, and no key stays in memory. A wrong key or a damaged header returns the same errors as `open`.
 
 ## Things to keep in mind
 

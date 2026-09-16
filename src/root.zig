@@ -11,9 +11,11 @@ pub const FileStorage = raf.FileStorage;
 pub const Info = raf.Info;
 pub const AlgId = raf.AlgId;
 pub const CreateOptions = raf.CreateOptions;
+pub const OpenOptions = raf.OpenOptions;
 
 pub const chunk_size_min = raf.chunk_size_min;
 pub const chunk_size_max = raf.chunk_size_max;
+pub const scratch_chunks_max = raf.scratch_chunks_max;
 pub const header_size = raf.header_size;
 pub const file_id_bytes = raf.file_id_bytes;
 

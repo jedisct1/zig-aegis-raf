@@ -63,7 +63,7 @@ test "aegis128l_raf: open existing file" {
         ctx.close();
     }
 
-    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, &key);
+    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
 
     try testing.expectEqual("Test data for re-open".len, ctx.length());
@@ -161,7 +161,7 @@ test "aegis128l_raf: header tampering is detected" {
 
     mem.bytes.items[20] ^= 0x01;
 
-    try testing.expectError(error.AuthenticationFailed, Aegis128LRaf.open(testing.allocator, &mem, random, &key));
+    try testing.expectError(error.AuthenticationFailed, Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key));
 }
 
 test "aegis128l_raf: chunk tampering is detected" {
@@ -182,7 +182,7 @@ test "aegis128l_raf: chunk tampering is detected" {
     const chunk_offset = raf.header_size + Aegis128LRaf.nonce_length + 512;
     mem.bytes.items[chunk_offset] ^= 0x01;
 
-    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, &key);
+    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
 
     var buf: [1024]u8 = undefined;
@@ -202,7 +202,7 @@ test "aegis128l_raf: wrong key is detected" {
         ctx.close();
     }
 
-    try testing.expectError(error.AuthenticationFailed, Aegis128LRaf.open(testing.allocator, &mem, random, &key2));
+    try testing.expectError(error.AuthenticationFailed, Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key2));
 }
 
 test "aegis256_raf: basic operations" {
@@ -217,7 +217,7 @@ test "aegis256_raf: basic operations" {
         ctx.close();
     }
 
-    var ctx = try Aegis256Raf.open(testing.allocator, &mem, random, &key);
+    var ctx = try Aegis256Raf.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
 
     var buf: [64]u8 = undefined;
@@ -240,7 +240,7 @@ test "aegis_raf: algorithm mismatch is detected" {
         ctx.close();
     }
 
-    try testing.expectError(error.AlgorithmMismatch, Aegis256Raf.open(testing.allocator, &mem, random, &key256));
+    try testing.expectError(error.AlgorithmMismatch, Aegis256Raf.open(testing.allocator, &mem, random, .{}, &key256));
 }
 
 test "aegis128l_raf: EOF behavior" {
@@ -273,7 +273,7 @@ test "aegis128l_raf: empty file" {
         ctx.close();
     }
 
-    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, &key);
+    var ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
     try testing.expectEqual(0, ctx.length());
 }
@@ -358,7 +358,7 @@ test "aegis128l_raf: truncate grow across chunk boundaries" {
     for (zeros[0..n]) |b| try testing.expectEqual(0, b);
 
     ctx.close();
-    ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, &key);
+    ctx = try Aegis128LRaf.open(testing.allocator, &mem, random, .{}, &key);
     try testing.expectEqual(3500, ctx.length());
     n = try ctx.read(&buf, 0);
     try testing.expectEqualSlices(u8, &data, buf[0..n]);
@@ -453,6 +453,7 @@ const FailingStorage = struct {
     // The next write that starts at this offset is refused as a whole.
     // The header is at offset 0, a chunk record at its `chunkOffset`.
     fail_next_write_at: ?u64 = null,
+    set_length_calls: usize = 0,
 
     fn deinit(self: *FailingStorage) void {
         self.inner.deinit();
@@ -492,6 +493,7 @@ const FailingStorage = struct {
     }
 
     pub fn setLength(self: *FailingStorage, new_length: u64) Error!void {
+        self.set_length_calls += 1;
         if (self.fail_next_shrink and new_length < self.inner.bytes.items.len) {
             self.fail_next_shrink = false;
             return error.InjectedFailure;
@@ -524,7 +526,7 @@ test "aegis128l_raf: a failed write requires reopen and does not lose data" {
     try testing.expectError(error.ContextFailed, ctx.write("hello", 0));
 
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     // The header write never landed, so the file is still empty.
     try testing.expectEqual(0, ctx.length());
@@ -549,8 +551,15 @@ test "aegis128l_raf: a torn header write recovers the preceding header" {
     try testing.expectError(error.InjectedFailure, ctx.write("new", 3));
     try testing.expectError(error.ContextFailed, ctx.read(&.{}, 0));
 
+    // Verification must recover without repairing or removing the trailer.
+    const before = try testing.allocator.dupe(u8, storage.inner.bytes.items);
+    defer testing.allocator.free(before);
+    const info = try RafT.verify(&storage, &key);
+    try testing.expectEqual(3, info.file_size);
+    try testing.expectEqualSlices(u8, before, storage.inner.bytes.items);
+
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     try testing.expectEqual(3, ctx.length());
     var buf: [3]u8 = undefined;
@@ -561,7 +570,7 @@ test "aegis128l_raf: a torn header write recovers the preceding header" {
     // trailer before changing the recovered file.
     try testing.expectEqual(1, try ctx.write("!", 3));
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
     try testing.expectEqual(4, ctx.length());
     var repaired: [4]u8 = undefined;
     try testing.expectEqual(4, try ctx.read(&repaired, 0));
@@ -587,7 +596,7 @@ test "aegis128l_raf: a torn shrink header recovers the preceding file" {
     try testing.expectError(error.InjectedFailure, ctx.setLength(500));
 
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     try testing.expectEqual(data.len, ctx.length());
     var recovered: [2000]u8 = undefined;
@@ -614,7 +623,7 @@ test "aegis128l_raf: a failed shrink requires reopen and does not lose data" {
     try testing.expectError(error.ContextFailed, ctx.setLength(500));
 
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     // The smaller header never landed, so the original 2000 bytes survive.
     try testing.expectEqual(2000, ctx.length());
@@ -645,7 +654,7 @@ test "aegis128l_raf: reopening after a failed physical shrink lets a same-size r
     try testing.expectError(error.ContextFailed, ctx.setLength(0));
 
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     // The header already committed size 0. Only the backing store is still oversized.
     try testing.expectEqual(0, ctx.length());
@@ -712,7 +721,7 @@ fn roundTrip(comptime Variant: fn (type) type, chunk_size: u32) !void {
         _ = try ctx.write(&data, 0);
     }
 
-    var ctx = try RafT.open(testing.allocator, &mem, random, &key);
+    var ctx = try RafT.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
 
     var buf: [5000]u8 = undefined;
@@ -750,7 +759,7 @@ test "aegis128l_raf: FileStorage round-trips through a real file" {
 
     // Reopen to confirm the header and chunks actually made it to disk,
     // rather than just checking the still-open context's own state.
-    var ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    var ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
     defer ctx.close();
 
     const out = try testing.allocator.alloc(u8, data.len);
@@ -816,7 +825,7 @@ test "aegis128x2_raf: writeInPlace round-trips and leaves ciphertext behind" {
     try testing.expect(!std.mem.eql(u8, data[524..][0..1024], buf[524..][0..1024]));
     try testing.expectEqualSlices(u8, data[0..524], buf[0..524]);
 
-    var ctx = try RafT.open(testing.allocator, &mem, random, &key);
+    var ctx = try RafT.open(testing.allocator, &mem, random, .{}, &key);
     defer ctx.close();
     try testing.expectEqual(500 + data.len, ctx.length());
 
@@ -849,11 +858,120 @@ test "aegis128x2_raf: a damaged record fails a whole-chunk read" {
 
     const out = try testing.allocator.alloc(u8, data.len);
     defer testing.allocator.free(out);
+    @memset(out, 0xff);
     try testing.expectError(error.AuthenticationFailed, ctx.read(out, 0));
+
+    // A failed read must clear both plaintext and ciphertext from the output.
+    try testing.expect(std.mem.allEqual(u8, out, 0));
+    @memset(out[0..100], 0xff);
+    try testing.expectError(error.AuthenticationFailed, ctx.read(out[0..100], 3 * 1024 + 10));
+    try testing.expect(std.mem.allEqual(u8, out[0..100], 0));
 
     // The chunks before the damaged one still read on their own.
     try testing.expectEqual(3 * 1024, try ctx.read(out[0 .. 3 * 1024], 0));
     try testing.expectEqualSlices(u8, data[0 .. 3 * 1024], out[0 .. 3 * 1024]);
+}
+
+test "aegis128x2_raf: verify authenticates file metadata" {
+    const RafT = raf.Aegis128X2Raf(raf.MemoryStorage);
+
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    const key = newKey(RafT);
+    const wrong = newKey(RafT);
+    try testing.expectError(error.InvalidHeader, RafT.verify(&mem, &key));
+    {
+        var ctx = try RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024 }, &key);
+        defer ctx.close();
+        _ = try ctx.write("twelve bytes", 0);
+    }
+
+    const info = try RafT.verify(&mem, &key);
+    try testing.expectEqual(12, info.file_size);
+    try testing.expectEqual(1024, info.chunk_size);
+    try testing.expectEqual(.aegis128x2, info.alg_id);
+
+    try testing.expectError(error.AuthenticationFailed, RafT.verify(&mem, &wrong));
+    try testing.expectError(error.AlgorithmMismatch, raf.Aegis128LRaf(raf.MemoryStorage).verify(&mem, &key));
+
+    // Valid authentication doesn't excuse missing records.
+    try mem.setLength(mem.bytes.items.len - 1);
+    try testing.expectError(error.InvalidHeader, RafT.verify(&mem, &key));
+}
+
+test "aegis128x2_raf: batched writes preserve data outside the request" {
+    const RafT = raf.Aegis128X2Raf(raf.MemoryStorage);
+
+    var mem = raf.MemoryStorage.init(testing.allocator);
+    defer mem.deinit();
+
+    const key = newKey(RafT);
+    try testing.expectError(error.InvalidArgument, RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024, .scratch_chunks = 0 }, &key));
+    try testing.expectError(error.InvalidArgument, RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024, .scratch_chunks = raf.scratch_chunks_max + 1 }, &key));
+
+    // Exercise multiple batches and a partial tail.
+    const data = try testing.allocator.alloc(u8, 200 * 1024 + 7);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 29);
+    const out = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(out);
+
+    {
+        var ctx = try RafT.create(testing.allocator, &mem, random, .{ .chunk_size = 1024, .scratch_chunks = 8 }, &key);
+        defer ctx.close();
+
+        // Spare scratch capacity mustn't extend the write.
+        try testing.expectEqual(3 * 1024, try ctx.write(data[0 .. 3 * 1024], 0));
+        try testing.expectEqual(3 * 1024, ctx.length());
+        try testing.expectEqual(RafT.chunkOffset(1024, 3), try mem.length());
+
+        try testing.expectEqual(data.len, try ctx.write(data, 0));
+        try testing.expectEqual(data.len, ctx.length());
+        try testing.expectEqual(RafT.chunkOffset(1024, 201), try mem.length());
+
+        const patch: [5 * 1024]u8 = @splat('p');
+        try testing.expectEqual(patch.len, try ctx.write(&patch, 10 * 1024));
+        @memcpy(data[10 * 1024 ..][0..patch.len], &patch);
+        try testing.expectEqual(data.len, try ctx.read(out, 0));
+        try testing.expectEqualSlices(u8, data, out);
+    }
+
+    // Reopening may change the scratch capacity.
+    try testing.expectError(error.InvalidArgument, RafT.open(testing.allocator, &mem, random, .{ .scratch_chunks = 0 }, &key));
+    var ctx = try RafT.open(testing.allocator, &mem, random, .{ .scratch_chunks = 4 }, &key);
+    defer ctx.close();
+    try testing.expectEqual(data.len, try ctx.read(out, 0));
+    try testing.expectEqualSlices(u8, data, out);
+    try testing.expectEqual(RafT.chunkOffset(1024, 201), try mem.length());
+}
+
+test "aegis128l_raf: resize call counts for growth, overwrite, and shrink" {
+    const RafT = raf.Aegis128LRaf(FailingStorage);
+
+    var storage = FailingStorage{ .inner = raf.MemoryStorage.init(testing.allocator) };
+    defer storage.deinit();
+
+    const key = newKey(RafT);
+    var ctx = try RafT.create(testing.allocator, &storage, random, .{ .chunk_size = 1024 }, &key);
+    defer ctx.close();
+
+    // Reserve and remove the recovery trailer without extra resizes.
+    storage.set_length_calls = 0;
+    var data: [3000]u8 = undefined;
+    random.bytes(&data);
+    _ = try ctx.write(&data, 0);
+    try testing.expectEqual(2, storage.set_length_calls);
+    try testing.expectEqual(RafT.chunkOffset(1024, 3), try storage.length());
+
+    storage.set_length_calls = 0;
+    _ = try ctx.write(data[0..10], 100);
+    try testing.expectEqual(0, storage.set_length_calls);
+
+    storage.set_length_calls = 0;
+    try ctx.setLength(1000);
+    try testing.expectEqual(2, storage.set_length_calls);
+    try testing.expectEqual(RafT.chunkOffset(1024, 1), try storage.length());
 }
 
 test "aegis128l_raf: a record write that fails as a whole leaves every chunk readable" {
@@ -882,7 +1000,7 @@ test "aegis128l_raf: a record write that fails as a whole leaves every chunk rea
     try testing.expectError(error.InjectedFailure, ctx.writeInPlace(&fresh, 0));
 
     ctx.close();
-    ctx = try RafT.open(testing.allocator, &storage, random, &key);
+    ctx = try RafT.open(testing.allocator, &storage, random, .{}, &key);
 
     var out: [2048]u8 = undefined;
     try testing.expectEqual(out.len, try ctx.read(&out, 0));

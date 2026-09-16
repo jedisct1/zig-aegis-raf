@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try raf.write(message, 0);
     }
 
-    var raf = try RafFile.open(gpa, &storage, random, &key);
+    var raf = try RafFile.open(gpa, &storage, random, .{}, &key);
     defer raf.close();
 
     var buf: [message.len]u8 = undefined;
